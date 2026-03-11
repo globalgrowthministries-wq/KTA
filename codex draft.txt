@@ -1,0 +1,1740 @@
+/**
+ * Korean Tutor backend automation for Google Sheets + Softr.
+ *
+ * Notes:
+ * - All read/write operations use safe sheet access wrappers.
+ * - Runtime sheets are rebuilt with archived rows filtered out, and truncated
+ *   to stay within Softr free-tier row limits (1000).
+ */
+
+var CONFIG = {
+  SOFTR_RUNTIME_LIMIT: 1000,
+  SHEETS: {
+    VOCAB: 'Vocab',
+    NUMBERS_DICT: 'NumbersDict',
+    PARTICLE_MAP: 'ParticleMap',
+    LEMMA_DICT: 'LemmaDict',
+    UNIT_MODULE_MAP: 'UnitModule_Map',
+    CONTRIBUTORS: 'Contributors',
+    USERS: 'Users',
+    USERS_RUNTIME: 'Users_Runtime',
+    LEXICON_INDEX: 'LexiconIndex',
+    SENTENCES: 'Sentences',
+    LESSONS: 'Lessons',
+    QUIZZES: 'Quizzes',
+    SENTENCE_ASSEMBLY: 'SentenceAssembly',
+    SENTENCE_ASSEMBLY_TOKENS: 'SentenceAssemblyTokens',
+    TOKEN_AUDIT_ALL: 'TokenAudit_AllTokens',
+    TOKEN_AUDIT_RESOLVE: 'TokenAudit_Resolve',
+    WORD_BROWSER: 'WordBrowser',
+    SENTENCE_BROWSER: 'SentenceBrowser',
+    VOCAB_RUNTIME: 'Vocab_Runtime',
+    SENTENCES_RUNTIME: 'Sentences_Runtime',
+    LESSONS_RUNTIME: 'Lessons_Runtime',
+    QUIZZES_RUNTIME: 'Quizzes_Runtime'
+  }
+};
+
+/**
+ * Creates menu and keeps runtime sheets in sync on open.
+ */
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('Filter Tools')
+    .addItem('Reset Filters', 'resetFilters')
+    .addToUi();
+
+  ui.createMenu('Tutor Backend')
+    .addItem('Promote Drafts', 'processSentenceDrafts')
+    .addItem('Sync Tokens', 'syncSentenceAssemblyTokens')
+    .addItem('Add Selected Word to Draft', 'addSelectedWordToDraft')
+    .addItem('Full Runtime Refresh', 'refreshRuntimeEcosystem')
+    .addToUi();
+
+  refreshRuntimeEcosystem();
+}
+
+/**
+ * Clears runtime filter controls in browser sheets.
+ * - WordBrowser C3:C4
+ * - SentenceBrowser C4
+ */
+function resetFilters() {
+  var ss = SpreadsheetApp.getActive();
+  var wordBrowser = safeGetSheet_(ss, CONFIG.SHEETS.WORD_BROWSER);
+  var sentenceBrowser = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_BROWSER);
+
+  if (wordBrowser && wordBrowser.getLastRow() > 0) {
+    wordBrowser.getRange('C3').setValue('');
+    wordBrowser.getRange('C4').setValue('');
+  }
+
+  if (sentenceBrowser && sentenceBrowser.getLastRow() > 0) {
+    sentenceBrowser.getRange('C4').setValue('');
+  }
+
+  refreshRuntimeEcosystem();
+}
+
+/**
+ * Entry-point to refresh token audits and runtime browser data.
+ */
+function refreshRuntimeEcosystem() {
+  processSentenceDrafts();
+  syncSentenceAssemblyTokens();
+  updateTokenAudit();
+  updateSentenceAssemblyValidation();
+  evaluateMasteryArchiving();
+  refreshRuntimeSheets();
+}
+
+/**
+ * Auto-tokenizes SentenceAssembly.Korean_Compiled into SentenceAssemblyTokens.
+ * Adds only missing DraftID+Seq tokens so tutor edits are preserved.
+ */
+function syncSentenceAssemblyTokensFromDrafts() {
+  syncSentenceAssemblyTokens();
+  return;
+}
+
+function _deprecated_syncSentenceAssemblyTokensFromDrafts_impl() {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  if (!(assemblySheet && tokensSheet && assemblySheet.getLastRow() > 0)) return;
+
+  var assembly = getDataRowsWithHeaderMap_(assemblySheet, true);
+  if (assembly.rows.length === 0) return;
+
+  var tokenPayload = getDataRowsWithHeaderMap_(tokensSheet, true);
+  var headers = tokenPayload.headers.length > 0
+    ? tokenPayload.headers
+    : ['DraftTokenID', 'DraftID', 'Seq', 'VocabID', 'POS', 'Korean', 'Norm', 'Unit', 'Module', 'Created_At'];
+
+  var existing = {};
+  tokenPayload.rows.forEach(function (rowObj) {
+    var key = String(rowObj.DraftID || '').trim() + '|' + String(rowObj.Seq || '').trim();
+    if (key !== '|') existing[key] = true;
+  });
+
+  var rowsToAppend = [];
+  assembly.rows.forEach(function (rowObj) {
+    var draftId = String(rowObj.DraftID || '').trim();
+    var compiled = String(rowObj.Korean_Compiled || '').trim();
+    if (!draftId || !compiled) return;
+
+    var tokens = tokenizeKorean_(compiled);
+    for (var i = 0; i < tokens.length; i++) {
+      var seq = i + 1;
+      var key = draftId + '|' + seq;
+      if (existing[key]) continue;
+
+      rowsToAppend.push({
+        DraftTokenID: draftId + '-' + seq,
+        DraftID: draftId,
+        Seq: seq,
+        VocabID: '',
+        POS: '',
+        Korean: tokens[i],
+        Norm: tokens[i],
+        Unit: rowObj.Unit || '',
+        Module: rowObj.Module || '',
+        Created_At: new Date()
+      });
+      existing[key] = true;
+    }
+  });
+
+  if (rowsToAppend.length === 0) return;
+
+  var matrix = rowsToMatrix_(rowsToAppend, headers);
+  if (tokenPayload.headers.length === 0) {
+    writeRowsWithHeaders_(tokensSheet, headers, matrix);
+    return;
+  }
+
+  tokensSheet
+    .getRange(tokensSheet.getLastRow() + 1, 1, matrix.length, headers.length)
+    .setValues(matrix);
+}
+
+
+
+/**
+ * Convenience action for menu/button usage.
+ * Uses the active WordBrowser row to add a word into SentenceAssembly.
+ */
+function addSelectedWordToDraft() {
+  var targetDraftId = getWordBrowserTargetDraftId_();
+  addWordToDraft('', targetDraftId);
+}
+
+
+function getWordBrowserTargetDraftId_() {
+  var ss = SpreadsheetApp.getActive();
+  var wordBrowser = safeGetSheet_(ss, CONFIG.SHEETS.WORD_BROWSER);
+  if (!(wordBrowser && wordBrowser.getLastRow() > 1 && wordBrowser.getLastColumn() > 0)) return '';
+
+  var payload = getDataRowsWithHeaderMap_(wordBrowser, true);
+  var idx = payload.headers.indexOf('Target_Draft_ID');
+  if (idx === -1) return '';
+
+  for (var r = 0; r < payload.values.length; r++) {
+    var value = String(payload.values[r][idx] || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function getEditedHeaderName_(sheet, columnIndex) {
+  if (!(sheet && columnIndex > 0 && sheet.getLastColumn() > 0)) return '';
+  var payload = getDataRowsWithHeaderMap_(sheet, true);
+  if (!payload.headers || payload.headers.length < columnIndex) return '';
+  return String(payload.headers[columnIndex - 1] || '').trim();
+}
+
+/**
+ * Adds a selected vocabulary item from WordBrowser into SentenceAssembly.
+ * If vocabID is omitted, attempts to resolve from current WordBrowser selection.
+ */
+function addWordToDraft(vocabID, draftID) {
+  var ss = SpreadsheetApp.getActive();
+  var wordBrowser = safeGetSheet_(ss, CONFIG.SHEETS.WORD_BROWSER);
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  if (!(wordBrowser && assemblySheet && tokensSheet)) return false;
+
+  var activeDraftId = String(draftID || getWordBrowserTargetDraftId_() || '').trim();
+  if (!activeDraftId) {
+    SpreadsheetApp.getUi().alert('No target draft found. Set Target_Draft_ID in WordBrowser first.');
+    return false;
+  }
+
+  var selected = resolveSelectedVocabRow_(wordBrowser, vocabID);
+  if (!selected || !selected.VocabID) return false;
+
+  var assemblyPayload = getDataRowsWithHeaderMap_(assemblySheet, true);
+  if (assemblyPayload.headers.length === 0 || assemblyPayload.values.length === 0) return false;
+
+  var aHeaders = assemblyPayload.headers;
+  var aValues = assemblyPayload.values;
+  var draftIdCol = ensureHeader_(assemblySheet, aHeaders, 'DraftID', aValues);
+  var unitCol = ensureHeader_(assemblySheet, aHeaders, 'Unit', aValues);
+  var moduleCol = ensureHeader_(assemblySheet, aHeaders, 'Module', aValues);
+
+  var activeRowIdx = -1;
+  for (var i = 0; i < aValues.length; i++) {
+    if (String(aValues[i][draftIdCol] || '').trim() === activeDraftId) {
+      activeRowIdx = i;
+      break;
+    }
+  }
+  if (activeRowIdx === -1) return false;
+
+  var selectedModule = String(selected.Module || '').trim();
+  var moduleVal = selectedModule || String(aValues[activeRowIdx][moduleCol] || '').trim();
+  var unitFromMap = resolveUnitFromModule_(moduleVal) || selected.Unit || '';
+
+  if (!String(aValues[activeRowIdx][unitCol] || '').trim() && moduleVal) {
+    aValues[activeRowIdx][unitCol] = unitFromMap;
+    if (moduleCol > -1 && !String(aValues[activeRowIdx][moduleCol] || '').trim()) {
+      aValues[activeRowIdx][moduleCol] = moduleVal;
+    }
+    if (isSchemaConsistent_(aHeaders, aValues)) {
+      assemblySheet.getRange(2, 1, aValues.length, aHeaders.length).setValues(aValues);
+    }
+  }
+
+  var tokenPayload = getDataRowsWithHeaderMap_(tokensSheet, true);
+  var tHeaders = tokenPayload.headers.length > 0 ? tokenPayload.headers : [];
+  var tValues = tokenPayload.values;
+  if (tHeaders.length === 0) return false;
+
+  var draftTokenIdCol = ensureHeader_(tokensSheet, tHeaders, 'DraftTokenID', tValues);
+  var tokenDraftIdCol = ensureHeader_(tokensSheet, tHeaders, 'DraftID', tValues);
+  var seqCol = ensureHeader_(tokensSheet, tHeaders, 'Seq', tValues);
+  var wordIdCol = ensureHeader_(tokensSheet, tHeaders, 'WordID', tValues);
+  var vocabIdCol = ensureHeader_(tokensSheet, tHeaders, 'VocabID', tValues);
+  var koreanCol = ensureHeader_(tokensSheet, tHeaders, 'Korean', tValues);
+  var tokenCol = tHeaders.indexOf('Token');
+  if (tokenCol === -1) tokenCol = ensureHeader_(tokensSheet, tHeaders, 'Token', tValues);
+  var posCol = tHeaders.indexOf('POS');
+  if (posCol === -1) posCol = ensureHeader_(tokensSheet, tHeaders, 'POS', tValues);
+  var unitTokenCol = ensureHeader_(tokensSheet, tHeaders, 'Unit', tValues);
+  var moduleTokenCol = ensureHeader_(tokensSheet, tHeaders, 'Module', tValues);
+  var createdAtCol = ensureHeader_(tokensSheet, tHeaders, 'Created_At', tValues);
+
+  var maxSeq = 0;
+  for (var t = 0; t < tValues.length; t++) {
+    if (String(tValues[t][tokenDraftIdCol] || '').trim() !== activeDraftId) continue;
+    var seq = Number(tValues[t][seqCol] || 0);
+    if (seq > maxSeq) maxSeq = seq;
+  }
+  var nextSeq = maxSeq + 1;
+
+  var alignedRow = new Array(tHeaders.length).fill('');
+  alignedRow[draftTokenIdCol] = activeDraftId + '-' + nextSeq;
+  alignedRow[tokenDraftIdCol] = activeDraftId;
+  alignedRow[seqCol] = nextSeq;
+  alignedRow[wordIdCol] = selected.VocabID || '';
+  alignedRow[vocabIdCol] = selected.VocabID || '';
+  alignedRow[koreanCol] = String(selected.Korean || '').trim();
+  alignedRow[tokenCol] = String(selected.Korean || '').trim();
+  alignedRow[posCol] = String(selected.POS || '').trim();
+  alignedRow[unitTokenCol] = String(unitFromMap || aValues[activeRowIdx][unitCol] || '').trim();
+  alignedRow[moduleTokenCol] = moduleVal;
+  alignedRow[createdAtCol] = new Date();
+
+  if (alignedRow.length !== tHeaders.length) return false;
+  tokensSheet.appendRow(alignedRow);
+
+  compileSentenceFromTokens(activeDraftId);
+  updateSentenceAssemblyValidation();
+  return true;
+}
+
+
+/**
+ * Promotes approved drafts from SentenceAssembly to Sentences.
+ * For each row with PromoteToSentence=true:
+ * - Generate SentenceID if missing.
+ * - Append sentence payload to Sentences.
+ * - Clear PromoteToSentence flag.
+ */
+function processSentenceDrafts() {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var sentencesSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCES);
+  if (!(assemblySheet && assemblySheet.getLastRow() > 0 && sentencesSheet && sentencesSheet.getLastRow() > 0)) return;
+
+  var assemblyPayload = getDataRowsWithHeaderMap_(assemblySheet, true);
+  var sentencesPayload = getDataRowsWithHeaderMap_(sentencesSheet, true);
+  if (assemblyPayload.rows.length === 0 || sentencesPayload.headers.length === 0) return;
+
+  var headers = assemblyPayload.headers;
+  var values = assemblyPayload.values;
+  var promoteCol = ensureHeader_(assemblySheet, headers, 'PromoteToSentence', values);
+  var sentenceIdCol = ensureHeader_(assemblySheet, headers, 'SentenceID', values);
+  var statusCol = ensureHeader_(assemblySheet, headers, 'Status', values);
+  var isValidCol = ensureHeader_(assemblySheet, headers, 'IsValid', values);
+
+  var existingSentenceIds = {};
+  sentencesPayload.rows.forEach(function (rowObj) {
+    var id = String(rowObj.SentenceID || '').trim();
+    if (id) existingSentenceIds[id] = true;
+  });
+
+  var rowsToAppend = [];
+  var updatedAssembly = false;
+
+  for (var i = 0; i < values.length; i++) {
+    var rowObj = mapRowToObject_(headers, values[i]);
+    if (!toBoolean_(rowObj.PromoteToSentence)) continue;
+
+    var contributorID = String(rowObj.ContributorID || '').trim();
+    if (!validateContributor(contributorID)) {
+      values[i][statusCol] = 'Unauthorized Contributor';
+      values[i][promoteCol] = false;
+      updatedAssembly = true;
+      continue;
+    }
+
+    var draftId = String(rowObj.DraftID || '').trim();
+    var compiledFromTokens = compileSentenceFromTokens(draftId);
+    var currentCompiled = String(rowObj.Korean_Compiled || '').trim();
+    var isValid = toBoolean_(values[i][isValidCol]);
+
+    if (!isValid) {
+      values[i][statusCol] = 'Blocked: Invalid Tokens';
+      updatedAssembly = true;
+      continue;
+    }
+
+    if (compiledFromTokens !== currentCompiled) {
+      values[i][statusCol] = 'Blocked: Compile Mismatch';
+      updatedAssembly = true;
+      continue;
+    }
+
+    if (!isUnitModuleValid_(String(rowObj.Unit || '').trim(), String(rowObj.Module || '').trim())) {
+      values[i][statusCol] = 'Blocked: Unit/Module Mismatch';
+      updatedAssembly = true;
+      continue;
+    }
+
+    var sentenceId = String(rowObj.SentenceID || '').trim();
+    if (!sentenceId) {
+      sentenceId = nextSentenceId_(existingSentenceIds);
+      values[i][sentenceIdCol] = sentenceId;
+    }
+    existingSentenceIds[sentenceId] = true;
+
+    var sentenceRowObj = {
+      SentenceID: sentenceId,
+      Korean: currentCompiled,
+      English: rowObj.English_Translation || '',
+      Norm: rowObj.Norm || '',
+      Unit: rowObj.Unit || '',
+      Module: rowObj.Module || '',
+      LessonID: rowObj.LessonID || '',
+      Status: rowObj.Status || 'Published',
+      Archived: false
+    };
+    rowsToAppend.push(rowsToMatrix_([sentenceRowObj], sentencesPayload.headers)[0]);
+
+    values[i][promoteCol] = false;
+    values[i][statusCol] = 'Promoted';
+    updatedAssembly = true;
+  }
+
+  if (rowsToAppend.length > 0 && isSchemaConsistent_(sentencesPayload.headers, rowsToAppend)) {
+    sentencesSheet.getRange(sentencesSheet.getLastRow() + 1, 1, rowsToAppend.length, sentencesPayload.headers.length).setValues(rowsToAppend);
+  }
+
+  if (updatedAssembly && isSchemaConsistent_(headers, values)) {
+    assemblySheet.getRange(2, 1, values.length, headers.length).setValues(values);
+  }
+}
+
+/**
+ * Rebuilds SentenceAssemblyTokens from SentenceAssembly using space/punctuation tokenization.
+ * Clears existing rows (excluding header) and writes DraftID, Seq, Korean, Unit, Module, Created_At.
+ */
+function syncSentenceAssemblyTokens() {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  if (!(assemblySheet && tokensSheet && assemblySheet.getLastRow() > 0)) return;
+
+  var headers = [
+    'DraftTokenID',
+    'DraftID',
+    'Seq',
+    'Korean',
+    'Norm',
+    'VocabID',
+    'POS',
+    'Stem',
+    'ValidationStatus',
+    'Unit',
+    'Module',
+    'Created_At'
+  ];
+
+  var vocabLookup = buildVocabLookupByToken_();
+  var particleSet = buildParticleMapSet_();
+  var lemmaSet = buildLemmaSurfaceSet_();
+  var assemblyRows = getDataRowsWithHeaderMap_(assemblySheet);
+  var tokenRows = [];
+
+  assemblyRows.forEach(function (rowObj) {
+    var draftId = String(rowObj.DraftID || '').trim();
+    var compiled = String(rowObj.Korean_Compiled || '').trim();
+    if (!draftId || !compiled) return;
+
+    var splitTokens = tokenizeKorean_(compiled);
+    splitTokens.forEach(function (rawToken, idx) {
+      var token = normalizeToken_(rawToken);
+      if (!token) return;
+
+      var vocab = vocabLookup[token] || null;
+      var inParticle = !!particleSet[token];
+      var inLemma = !!lemmaSet[token];
+      var resolved = !!(vocab || inParticle || inLemma);
+
+      tokenRows.push({
+        DraftTokenID: draftId + '-' + (idx + 1),
+        DraftID: draftId,
+        Seq: idx + 1,
+        Korean: token,
+        Norm: vocab && vocab.Norm ? vocab.Norm : token,
+        VocabID: vocab ? vocab.VocabID : '',
+        POS: vocab ? vocab.POS : (inParticle ? 'PARTICLE' : (inLemma ? 'LEMMA' : '')),
+        Stem: vocab ? vocab.Stem : '',
+        ValidationStatus: resolved ? 'RESOLVED' : 'UNRESOLVED',
+        Unit: rowObj.Unit || '',
+        Module: rowObj.Module || '',
+        Created_At: new Date()
+      });
+    });
+  });
+
+  writeRowsWithHeaders_(tokensSheet, headers, rowsToMatrix_(tokenRows, headers));
+}
+
+/**
+ * Backward-compatible wrapper.
+ */
+function syncAssemblyTokens() {
+  syncSentenceAssemblyTokens();
+}
+
+/**
+ * Detailed token validation sync retained for compatibility and audit tooling.
+ */
+function _detailedSyncAssemblyTokensForAudit_() {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  if (!(assemblySheet && tokensSheet && assemblySheet.getLastRow() > 0)) return;
+
+  var headers = ['DraftTokenID', 'DraftID', 'Seq', 'VocabID', 'POS', 'Korean', 'Norm', 'Unit', 'Module', 'Created_At'];
+  var assemblyRows = getDataRowsWithHeaderMap_(assemblySheet);
+  var vocabLookup = buildVocabLookupByToken_();
+  var particleMap = buildParticleMapSet_();
+  var lemmaMap = buildLemmaSurfaceSet_();
+
+  var tokenRows = [];
+  assemblyRows.forEach(function (rowObj) {
+    var draftId = String(rowObj.DraftID || '').trim();
+    var compiled = String(rowObj.Korean_Compiled || '').trim();
+    if (!draftId || !compiled) return;
+
+    var splitTokens = tokenizeKorean_(compiled);
+    for (var i = 0; i < splitTokens.length; i++) {
+      var token = normalizeToken_(splitTokens[i]);
+      if (!token) continue;
+
+      var foundVocab = vocabLookup[token] || null;
+      var inParticle = !!particleMap[token];
+      var inLemma = !!lemmaMap[token];
+      var pos = foundVocab ? foundVocab.POS : (inParticle ? 'PARTICLE' : (inLemma ? 'LEMMA' : 'UNRESOLVED'));
+
+      tokenRows.push({
+        DraftTokenID: draftId + '-' + (i + 1),
+        DraftID: draftId,
+        Seq: i + 1,
+        VocabID: foundVocab ? foundVocab.VocabID : '',
+        POS: pos,
+        Korean: token,
+        Norm: token,
+        Unit: rowObj.Unit || '',
+        Module: rowObj.Module || '',
+        Created_At: new Date()
+      });
+    }
+  });
+
+  writeRowsWithHeaders_(tokensSheet, headers, rowsToMatrix_(tokenRows, headers));
+}
+
+
+/**
+ * Archives a specific item by sheet and ID.
+ * For Sentences, optional reason is written to Archive_Reason when provided.
+ */
+function archiveItem(sheetName, itemID) {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = safeGetSheet_(ss, sheetName);
+  if (!(sheet && sheet.getLastRow() > 0 && sheet.getLastColumn() > 0)) return false;
+
+  var payload = getDataRowsWithHeaderMap_(sheet, true);
+  if (payload.rows.length === 0) return false;
+
+  var headers = payload.headers;
+  var values = payload.values;
+  var idHeader = resolveIdHeader_(sheetName, headers);
+  if (!idHeader) return false;
+
+  var idIndex = headers.indexOf(idHeader);
+  var archivedCol = ensureHeader_(sheet, headers, 'Archived', values);
+  var target = String(itemID || '').trim();
+  if (!target) return false;
+
+  var found = false;
+  for (var i = 0; i < values.length; i++) {
+    if (String(values[i][idIndex] || '').trim() !== target) continue;
+    values[i][archivedCol] = true;
+    found = true;
+    break;
+  }
+
+  if (!found) return false;
+  sheet.getRange(2, 1, values.length, headers.length).setValues(values);
+  refreshRuntimeSheets();
+  return true;
+}
+
+/**
+ * Auto-archives mastered sentences based on UserProgress mastery threshold.
+ */
+function evaluateMasteryArchiving() {
+  var ss = SpreadsheetApp.getActive();
+  var sentencesSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCES);
+  if (!(sentencesSheet && sentencesSheet.getLastRow() > 0)) return;
+
+  var masteryByItem = getMasteryScores();
+  var sentencePayload = getDataRowsWithHeaderMap_(sentencesSheet, true);
+  if (sentencePayload.rows.length === 0) return;
+
+  var headers = sentencePayload.headers;
+  var values = sentencePayload.values;
+  var idIndex = headers.indexOf('SentenceID');
+  if (idIndex === -1) return;
+
+  var archivedCol = ensureHeader_(sentencesSheet, headers, 'Archived', values);
+  var reasonCol = ensureHeader_(sentencesSheet, headers, 'Archive_Reason', values);
+
+  var updated = false;
+  for (var i = 0; i < values.length; i++) {
+    var sentenceId = String(values[i][idIndex] || '').trim();
+    if (!sentenceId) continue;
+    var mastery = Number(masteryByItem[sentenceId] || 0);
+    if (mastery < 5) continue;
+    if (toBoolean_(values[i][archivedCol])) continue;
+
+    values[i][archivedCol] = true;
+    if (!String(values[i][reasonCol] || '').trim()) {
+      values[i][reasonCol] = 'Mastery threshold reached (>=5)';
+    }
+    updated = true;
+  }
+
+  if (updated && isSchemaConsistent_(headers, values)) {
+    sentencesSheet.getRange(2, 1, values.length, headers.length).setValues(values);
+  }
+}
+
+/**
+ * Updates runtime sheets for Softr consumption.
+ * Ensures Sentences_Runtime excludes archived rows from Sentences.
+ */
+function refreshRuntimeSheets() {
+  evaluateMasteryArchiving();
+  rebuildLexiconIndex_();
+
+  var ss = SpreadsheetApp.getActive();
+  var mappings = [
+    { source: CONFIG.SHEETS.VOCAB, runtime: CONFIG.SHEETS.VOCAB_RUNTIME },
+    { source: CONFIG.SHEETS.SENTENCES, runtime: CONFIG.SHEETS.SENTENCES_RUNTIME },
+    { source: CONFIG.SHEETS.LESSONS, runtime: CONFIG.SHEETS.LESSONS_RUNTIME },
+    { source: CONFIG.SHEETS.QUIZZES, runtime: CONFIG.SHEETS.QUIZZES_RUNTIME }
+  ];
+
+  var vocabCount = 0;
+  var sentenceCount = 0;
+
+  mappings.forEach(function (map) {
+    var source = safeGetSheet_(ss, map.source);
+    var runtime = safeGetSheet_(ss, map.runtime);
+    if (!(source && runtime && source.getLastRow() > 0 && source.getLastColumn() > 0)) return;
+
+    var values = source.getRange(1, 1, source.getLastRow(), source.getLastColumn()).getValues();
+    if (values.length === 0) return;
+
+    var headers = values[0];
+    var rows = values.slice(1);
+
+    var ARCHIVED_INDEX = headers.indexOf('Archived');
+    var MODULE_INDEX = headers.indexOf('Module');
+    var STATUS_INDEX = headers.indexOf('Status');
+    if (STATUS_INDEX === -1) STATUS_INDEX = headers.indexOf('Lesson Status');
+    if (STATUS_INDEX === -1) STATUS_INDEX = headers.indexOf('Lesson_Status');
+    if (STATUS_INDEX === -1) STATUS_INDEX = headers.indexOf('Quiz Status');
+    if (STATUS_INDEX === -1) STATUS_INDEX = headers.indexOf('Quiz_Status');
+
+    var data = rows.filter(function (row) {
+      var archived = ARCHIVED_INDEX > -1 ? toBoolean_(row[ARCHIVED_INDEX]) : false;
+      var outsideLD = MODULE_INDEX > -1 ? String(row[MODULE_INDEX] || '').trim() === 'Outside LD' : false;
+      var outsideLDFlagIndex = headers.indexOf('OutsideLD');
+      var outsideLDFlag = outsideLDFlagIndex > -1 ? toBoolean_(row[outsideLDFlagIndex]) : false;
+      var statusArchived = STATUS_INDEX > -1 ? String(row[STATUS_INDEX] || '').toUpperCase() === 'ARCHIVED' : false;
+      return archived !== true && outsideLD !== true && outsideLDFlag !== true && statusArchived !== true;
+    });
+
+    data = data.slice(0, CONFIG.SOFTR_RUNTIME_LIMIT);
+    overwriteRuntimeSheet_(runtime, headers, data);
+
+    if (map.source === CONFIG.SHEETS.VOCAB) vocabCount = data.length;
+    if (map.source === CONFIG.SHEETS.SENTENCES) sentenceCount = data.length;
+  });
+
+  syncUserGroups();
+
+  updateDashboardCounts(vocabCount, sentenceCount);
+}
+
+function syncUserGroups() {
+  var ss = SpreadsheetApp.getActive();
+  var usersSheet = safeGetSheet_(ss, CONFIG.SHEETS.USERS);
+  var usersRuntimeSheet = safeGetSheet_(ss, CONFIG.SHEETS.USERS_RUNTIME);
+  if (!(usersSheet && usersRuntimeSheet && usersSheet.getLastRow() > 0 && usersSheet.getLastColumn() > 0)) return;
+
+  var payload = getDataRowsWithHeaderMap_(usersSheet, true);
+  if (payload.headers.length === 0) return;
+
+  var roleIndex = payload.headers.indexOf('User_Role');
+  if (roleIndex === -1) return;
+
+  var filtered = payload.values.filter(function (row) {
+    var role = String(row[roleIndex] || '').trim().toUpperCase();
+    return role === 'TUTOR' || role === 'STUDENT';
+  });
+
+  filtered = filtered.slice(0, CONFIG.SOFTR_RUNTIME_LIMIT);
+  writeRowsWithHeaders_(usersRuntimeSheet, payload.headers, filtered);
+}
+
+function updateRuntimeSheets() {
+  refreshRuntimeSheets();
+}
+
+/**
+ * Rebuilds TokenAudit_AllTokens and TokenAudit_Resolve from SentenceAssemblyTokens.
+ */
+function updateTokenAudit() {
+  var ss = SpreadsheetApp.getActive();
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  var tokenAuditAll = safeGetSheet_(ss, CONFIG.SHEETS.TOKEN_AUDIT_ALL);
+  var tokenAuditResolve = safeGetSheet_(ss, CONFIG.SHEETS.TOKEN_AUDIT_RESOLVE);
+
+  if (!(tokensSheet && tokensSheet.getLastRow() > 0 && tokenAuditAll && tokenAuditResolve)) {
+    return;
+  }
+
+  var tokenRows = getDataRowsWithHeaderMap_(tokensSheet);
+  if (tokenRows.length === 0) {
+    writeRowsWithHeaders_(tokenAuditAll, ['Token'], []);
+    writeRowsWithHeaders_(
+      tokenAuditResolve,
+      ['Token', 'In_Vocab', 'In_ParticleMap', 'In_LemmaDict', 'Resolution', 'Token_Length'],
+      []
+    );
+    return;
+  }
+
+  var tokenSet = {};
+  tokenRows.forEach(function (rowObj) {
+    var token = normalizeToken_(rowObj.Korean || rowObj.Norm);
+    if (token) tokenSet[token] = true;
+  });
+
+  var allTokens = Object.keys(tokenSet).sort();
+  writeRowsWithHeaders_(
+    tokenAuditAll,
+    ['Token'],
+    allTokens.map(function (t) {
+      return [t];
+    })
+  );
+
+  var vocabTokens = buildVocabTokenSet_();
+  var particleMap = buildParticleMapSet_();
+  var lemmaMap = buildLemmaSurfaceSet_();
+
+  var resolveRows = allTokens.map(function (token) {
+    var inVocab = !!vocabTokens[token];
+    var inParticle = !!particleMap[token];
+    var inLemma = !!lemmaMap[token];
+    var resolution = inVocab || inParticle || inLemma ? 'Valid' : 'FLAG';
+    return [token, inVocab, inParticle, inLemma, resolution, token.length];
+  });
+
+  writeRowsWithHeaders_(
+    tokenAuditResolve,
+    ['Token', 'In_Vocab', 'In_ParticleMap', 'In_LemmaDict', 'Resolution', 'Token_Length'],
+    resolveRows
+  );
+}
+
+/**
+ * Flags sentence assembly drafts when they contain unresolved tokens.
+ */
+function updateSentenceAssemblyValidation() {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  var vocabSheet = safeGetSheet_(ss, CONFIG.SHEETS.VOCAB);
+  if (!(assemblySheet && assemblySheet.getLastRow() > 0 && tokensSheet && tokensSheet.getLastRow() > 0 && vocabSheet && vocabSheet.getLastRow() > 0)) return;
+
+  var assemblyData = getDataRowsWithHeaderMap_(assemblySheet, true);
+  var tokenData = getDataRowsWithHeaderMap_(tokensSheet, true);
+  var vocabRows = getDataRowsWithHeaderMap_(vocabSheet);
+  if (assemblyData.rows.length === 0 || tokenData.rows.length === 0) return;
+
+  var vocabTokens = {};
+  vocabRows.forEach(function (rowObj) {
+    [rowObj.Korean, rowObj.Norm, rowObj.Stem].forEach(function (token) {
+      var key = String(token || '').trim();
+      if (key) vocabTokens[key] = true;
+    });
+  });
+
+  var aHeaders = assemblyData.headers;
+  var aValues = assemblyData.values;
+  var tHeaders = tokenData.headers;
+  var tValues = tokenData.values;
+
+  var validationCol = ensureHeader_(assemblySheet, aHeaders, 'ValidationStatus', aValues);
+  var invalidCol = ensureHeader_(assemblySheet, aHeaders, 'InvalidTokens', aValues);
+  var isValidCol = ensureHeader_(assemblySheet, aHeaders, 'IsValid', aValues);
+  var draftIdIndex = aHeaders.indexOf('DraftID');
+  if (draftIdIndex === -1) return;
+
+  var tokenKoreanCol = tHeaders.indexOf('Token');
+  if (tokenKoreanCol === -1) tokenKoreanCol = ensureHeader_(tokensSheet, tHeaders, 'Korean', tValues);
+  var tokenDraftCol = ensureHeader_(tokensSheet, tHeaders, 'DraftID', tValues);
+  var tokenValidationCol = ensureHeader_(tokensSheet, tHeaders, 'ValidationStatus', tValues);
+
+  var byDraft = {};
+  for (var i = 0; i < tValues.length; i++) {
+    var draftId = String(tValues[i][tokenDraftCol] || '').trim();
+    if (!draftId) continue;
+    var token = String(tValues[i][tokenKoreanCol] || '').trim();
+    var valid = !!vocabTokens[token];
+    tValues[i][tokenValidationCol] = valid ? 'RESOLVED' : 'UNRESOLVED';
+
+    if (!byDraft[draftId]) byDraft[draftId] = { valid: true, invalid: [] };
+    if (!valid) {
+      byDraft[draftId].valid = false;
+      byDraft[draftId].invalid.push(token);
+    }
+  }
+
+  var updatedAssembly = false;
+  for (var r = 0; r < aValues.length; r++) {
+    var did = String(aValues[r][draftIdIndex] || '').trim();
+    if (!did || !byDraft[did]) continue;
+    aValues[r][isValidCol] = byDraft[did].valid;
+    aValues[r][validationCol] = byDraft[did].valid ? 'PASS' : 'FLAG';
+    aValues[r][invalidCol] = byDraft[did].invalid.map(function (x) { return String(x || '').trim(); }).join(', ');
+    updatedAssembly = true;
+  }
+
+  if (updatedAssembly && isSchemaConsistent_(aHeaders, aValues)) {
+    assemblySheet.getRange(2, 1, aValues.length, aHeaders.length).setValues(aValues);
+  }
+  if (isSchemaConsistent_(tHeaders, tValues)) {
+    tokensSheet.getRange(2, 1, tValues.length, tHeaders.length).setValues(tValues);
+  }
+}
+
+/**
+ * Runtime for vocabulary filtered by WordBrowser C3 (POS) and C4 (Module).
+ */
+function refreshWordBrowserRuntime() {
+  var ss = SpreadsheetApp.getActive();
+  var wordBrowser = safeGetSheet_(ss, CONFIG.SHEETS.WORD_BROWSER);
+  var vocabRuntime = safeGetSheet_(ss, CONFIG.SHEETS.VOCAB_RUNTIME);
+  var vocabSheet = safeGetSheet_(ss, CONFIG.SHEETS.VOCAB);
+
+  if (!(wordBrowser && vocabRuntime && vocabSheet && wordBrowser.getLastRow() > 0 && vocabSheet.getLastRow() > 0)) {
+    return;
+  }
+
+  var posFilter = String(wordBrowser.getRange('C3').getDisplayValue() || '').trim();
+  var moduleFilter = String(wordBrowser.getRange('C4').getDisplayValue() || '').trim();
+
+  var vocabData = getDataRowsWithHeaderMap_(vocabSheet, true);
+  if (vocabData.rows.length === 0) {
+    writeRowsWithHeaders_(vocabRuntime, vocabData.headers, []);
+    return;
+  }
+
+  var filtered = vocabData.rows.filter(function (rowObj) {
+    var matchesFilter = (!posFilter || String(rowObj.POS || '').trim() === posFilter) &&
+      (!moduleFilter || String(rowObj.Module || '').trim() === moduleFilter);
+    var archivedOk = !toBoolean_(rowObj.Archived);
+    var status = String(rowObj.Status || '').toUpperCase();
+    return matchesFilter && archivedOk && status !== 'ARCHIVED';
+  }).slice(0, CONFIG.SOFTR_RUNTIME_LIMIT);
+
+  writeRowsWithHeaders_(vocabRuntime, vocabData.headers, rowsToMatrix_(filtered, vocabData.headers));
+}
+
+/**
+ * Runtime sentence browser synced to WordBrowser C4 Module.
+ */
+function refreshSentenceBrowserRuntime() {
+  var ss = SpreadsheetApp.getActive();
+  var wordBrowser = safeGetSheet_(ss, CONFIG.SHEETS.WORD_BROWSER);
+  var sentenceBrowser = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_BROWSER);
+  var sentencesRuntime = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCES_RUNTIME);
+  var sentencesSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCES);
+
+  if (!(wordBrowser && sentenceBrowser && sentencesRuntime && sentencesSheet && sentencesSheet.getLastRow() > 0)) {
+    return;
+  }
+
+  var moduleFromWordBrowser = String(wordBrowser.getRange('C4').getDisplayValue() || '').trim();
+  if (sentenceBrowser.getLastRow() > 0) {
+    sentenceBrowser.getRange('C4').setValue(moduleFromWordBrowser);
+  }
+
+  var sentenceData = getDataRowsWithHeaderMap_(sentencesSheet, true);
+  if (sentenceData.rows.length === 0) {
+    writeRowsWithHeaders_(sentencesRuntime, sentenceData.headers, []);
+    return;
+  }
+
+  var validSentenceIds = buildValidSentenceIdSet_();
+
+  var filtered = sentenceData.rows.filter(function (rowObj) {
+    var moduleOk = !moduleFromWordBrowser || String(rowObj.Module || '').trim() === moduleFromWordBrowser;
+    var archivedOk = !toBoolean_(rowObj.Archived);
+    var statusOk = String(rowObj.Status || '').toUpperCase() !== 'ARCHIVED';
+    var sentenceId = String(rowObj.SentenceID || '').trim();
+    var validationOk = !sentenceId || validSentenceIds[sentenceId] !== false;
+    return moduleOk && archivedOk && statusOk && validationOk;
+  }).slice(0, CONFIG.SOFTR_RUNTIME_LIMIT);
+
+  writeRowsWithHeaders_(sentencesRuntime, sentenceData.headers, rowsToMatrix_(filtered, sentenceData.headers));
+}
+
+/**
+ * Generic runtime views with archived content excluded.
+ */
+function refreshArchiveFilteredRuntimeViews() {
+  // Vocab_Runtime and Sentences_Runtime are managed by browser-aware refreshers.
+  refreshRuntimeSheet_(CONFIG.SHEETS.LESSONS, CONFIG.SHEETS.LESSONS_RUNTIME);
+  refreshRuntimeSheet_(CONFIG.SHEETS.QUIZZES, CONFIG.SHEETS.QUIZZES_RUNTIME);
+}
+
+function refreshRuntimeSheet_(sourceSheetName, runtimeSheetName) {
+  var ss = SpreadsheetApp.getActive();
+  var source = safeGetSheet_(ss, sourceSheetName);
+  var runtime = safeGetSheet_(ss, runtimeSheetName);
+
+  if (!(source && runtime && source.getLastRow() > 0)) return;
+
+  var payload = getDataRowsWithHeaderMap_(source, true);
+  var headers = payload.headers;
+  if (!headers || headers.length === 0) return;
+
+  var filtered = payload.rows.filter(function (rowObj) {
+    if (toBoolean_(rowObj.Archived)) return false;
+
+    if (sourceSheetName === CONFIG.SHEETS.VOCAB) {
+      var moduleValue = String(rowObj.Module || '').trim();
+      if (moduleValue === 'Outside LD') return false;
+    }
+
+    var status = String(
+      rowObj.Status ||
+      rowObj['Lesson Status'] ||
+      rowObj['Lesson_Status'] ||
+      rowObj['Quiz Status'] ||
+      rowObj['Quiz_Status'] ||
+      ''
+    ).toUpperCase();
+
+    return status !== 'ARCHIVED';
+  });
+
+  // Hard truncation: keep most recent rows up to configured Softr limit.
+  var limited = filtered.slice(-CONFIG.SOFTR_RUNTIME_LIMIT);
+  overwriteRuntimeSheet_(runtime, headers, rowsToMatrix_(limited, headers));
+}
+
+function overwriteRuntimeSheet_(runtimeSheet, headers, rows) {
+  if (!(runtimeSheet && headers && headers.length > 0)) return;
+  if (!isSchemaConsistent_(headers, rows)) return;
+
+  var maxCols = Math.max(runtimeSheet.getLastColumn(), headers.length);
+
+  if (runtimeSheet.getLastRow() > 1 && maxCols > 0) {
+    runtimeSheet.getRange(2, 1, runtimeSheet.getLastRow() - 1, maxCols).clearContent();
+  }
+
+  runtimeSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  if (rows && rows.length > 0) {
+    runtimeSheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+
+
+function updateDashboardCounts(vocabCount, sentenceCount) {
+  var dashboard = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Dashboard');
+  if (!(dashboard && dashboard.getLastColumn() > 0)) return;
+  dashboard.getRange('A2:B2').setValues([[Number(vocabCount || 0), Number(sentenceCount || 0)]]);
+}
+
+
+/** Helpers */
+
+function safeGetSheet_(ss, name) {
+  if (!ss || !name) return null;
+  return ss.getSheetByName(name);
+}
+
+function getDataRowsWithHeaderMap_(sheet, includeRaw) {
+  if (!(sheet && sheet.getLastRow() > 0 && sheet.getLastColumn() > 0)) {
+    return includeRaw ? { headers: [], rows: [], values: [] } : [];
+  }
+
+  var range = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn());
+  var values = range.getValues();
+  var headers = values[0].map(function (h) { return String(h || '').trim(); });
+  var rows = [];
+
+  for (var r = 1; r < values.length; r++) {
+    var rowObj = {};
+    for (var c = 0; c < headers.length; c++) {
+      if (headers[c]) rowObj[headers[c]] = values[r][c];
+    }
+    rows.push(rowObj);
+  }
+
+  if (includeRaw) {
+    return {
+      headers: headers,
+      rows: rows,
+      values: values.slice(1)
+    };
+  }
+
+  return rows;
+}
+
+function writeRowsWithHeaders_(sheet, headers, rows) {
+  if (!sheet) return;
+  if (!headers || headers.length === 0) return;
+  if (!isSchemaConsistent_(headers, rows)) return;
+
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows && rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+function rowsToMatrix_(rowObjects, headers) {
+  return rowObjects.map(function (rowObj) {
+    return headers.map(function (h) {
+      return rowObj[h] !== undefined ? rowObj[h] : '';
+    });
+  });
+}
+
+function ensureHeader_(sheet, headers, headerName, dataRows) {
+  var index = headers.indexOf(headerName);
+  if (index !== -1) return index;
+
+  headers.push(headerName);
+  var newCol = headers.length;
+  sheet.getRange(1, newCol).setValue(headerName);
+
+  for (var i = 0; i < dataRows.length; i++) {
+    dataRows[i].push('');
+  }
+
+  return newCol - 1;
+}
+
+function buildVocabTokenSet_() {
+  var ss = SpreadsheetApp.getActive();
+  var vocab = safeGetSheet_(ss, CONFIG.SHEETS.VOCAB);
+  var numbers = safeGetSheet_(ss, CONFIG.SHEETS.NUMBERS_DICT);
+  var set = {};
+
+  [vocab, numbers].forEach(function (sheet) {
+    if (!(sheet && sheet.getLastRow() > 0)) return;
+    var rows = getDataRowsWithHeaderMap_(sheet);
+    rows.forEach(function (rowObj) {
+      [rowObj.Korean, rowObj.Norm, rowObj.Stem].forEach(function (token) {
+        var t = normalizeToken_(token);
+        if (t) set[t] = true;
+      });
+    });
+  });
+
+  return set;
+}
+
+function buildParticleMapSet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = safeGetSheet_(ss, CONFIG.SHEETS.PARTICLE_MAP);
+  var set = {};
+  if (!(sheet && sheet.getLastRow() > 0)) return set;
+
+  var rows = getDataRowsWithHeaderMap_(sheet);
+  rows.forEach(function (rowObj) {
+    [rowObj.FusedToken, rowObj.BaseWord, rowObj.Particle].forEach(function (token) {
+      var t = normalizeToken_(token);
+      if (t) set[t] = true;
+    });
+  });
+
+  return set;
+}
+
+function buildLemmaSurfaceSet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = safeGetSheet_(ss, CONFIG.SHEETS.LEMMA_DICT);
+  var set = {};
+  if (!(sheet && sheet.getLastRow() > 0)) return set;
+
+  var rows = getDataRowsWithHeaderMap_(sheet);
+  rows.forEach(function (rowObj) {
+    [rowObj.SurfacePattern, rowObj.BaseVerb].forEach(function (token) {
+      var t = normalizeToken_(token);
+      if (t) set[t] = true;
+    });
+  });
+
+  return set;
+}
+
+function buildValidSentenceIdSet_() {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var set = {};
+  if (!(assemblySheet && assemblySheet.getLastRow() > 0)) return set;
+
+  var rows = getDataRowsWithHeaderMap_(assemblySheet);
+  rows.forEach(function (rowObj) {
+    var sentenceId = String(rowObj.SentenceID || '').trim();
+    if (!sentenceId) return;
+    var status = String(rowObj.ValidationStatus || '').toUpperCase();
+    if (status === 'FLAG') set[sentenceId] = false;
+    else if (set[sentenceId] !== false) set[sentenceId] = true;
+  });
+  return set;
+}
+
+function normalizeToken_(value) {
+  var token = String(value || '').trim();
+  if (!token) return '';
+  return token.replace(/\s+/g, ' ');
+}
+
+function tokenizeKorean_(text) {
+  var cleaned = String(text || '')
+    .replace(/[.,!?;:"'()\[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return [];
+  return cleaned.split(' ');
+}
+
+function toBoolean_(value) {
+  if (value === true || value === false) return value;
+  var normalized = String(value || '').trim().toLowerCase();
+  return ['true', 'yes', 'y', '1', 'archived'].indexOf(normalized) > -1;
+}
+
+
+function buildVocabLookupByToken_() {
+  var ss = SpreadsheetApp.getActive();
+  var vocabSheet = safeGetSheet_(ss, CONFIG.SHEETS.VOCAB);
+  var numbersSheet = safeGetSheet_(ss, CONFIG.SHEETS.NUMBERS_DICT);
+  var lookup = {};
+
+  [vocabSheet, numbersSheet].forEach(function (sheet) {
+    if (!(sheet && sheet.getLastRow() > 0)) return;
+
+    var rows = getDataRowsWithHeaderMap_(sheet);
+    rows.forEach(function (rowObj) {
+      var payload = {
+        VocabID: rowObj.VocabID || '',
+        POS: rowObj.POS || '',
+        Stem: rowObj.Stem || '',
+        Norm: rowObj.Norm || ''
+      };
+
+      [rowObj.Korean, rowObj.Norm, rowObj.Stem].forEach(function (token) {
+        var key = normalizeToken_(token);
+        if (!key || lookup[key]) return;
+        lookup[key] = payload;
+      });
+    });
+  });
+
+  return lookup;
+}
+
+
+
+
+function rebuildLexiconIndex_() {
+  var ss = SpreadsheetApp.getActive();
+  var lexSheet = safeGetSheet_(ss, CONFIG.SHEETS.LEXICON_INDEX);
+  if (!lexSheet) return;
+
+  var tokenSet = {};
+  var numberSet = {};
+
+  var vocabLookup = buildVocabLookupByToken_();
+  Object.keys(vocabLookup).forEach(function (token) {
+    if (!token) return;
+    tokenSet[token] = true;
+  });
+
+  var particleSet = buildParticleMapSet_();
+  Object.keys(particleSet).forEach(function (token) {
+    if (!token) return;
+    tokenSet[token] = true;
+  });
+
+  var lemmaSet = buildLemmaSurfaceSet_();
+  Object.keys(lemmaSet).forEach(function (token) {
+    if (!token) return;
+    tokenSet[token] = true;
+  });
+
+  var numbersSheet = safeGetSheet_(ss, CONFIG.SHEETS.NUMBERS_DICT);
+  if (numbersSheet && numbersSheet.getLastRow() > 0) {
+    getDataRowsWithHeaderMap_(numbersSheet).forEach(function (rowObj) {
+      var key = normalizeToken_(rowObj.Korean || rowObj.Norm || rowObj.Stem);
+      if (key) numberSet[key] = true;
+    });
+  }
+
+  var headers = ['AllTokens', 'Numbers'];
+  var tokens = Object.keys(tokenSet).sort();
+  var rows = tokens.map(function (token) {
+    return [token, numberSet[token] ? token : ''];
+  });
+
+  overwriteRuntimeSheet_(lexSheet, headers, rows);
+}
+
+function validateContributor(contributorID) {
+  var value = String(contributorID || '').trim().toLowerCase();
+  if (!value) return false;
+
+  var ss = SpreadsheetApp.getActive();
+  var sheet = safeGetSheet_(ss, CONFIG.SHEETS.USERS);
+  if (!(sheet && sheet.getLastRow() > 0 && sheet.getLastColumn() > 0)) return false;
+
+  var rows = getDataRowsWithHeaderMap_(sheet);
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var role = String(row.User_Role || '').trim().toUpperCase();
+    if (role !== 'TUTOR') continue;
+
+    var candidate = String(
+      row.ContributorID ||
+      row.UserEmail ||
+      row.Email ||
+      row.UserID ||
+      row.ID ||
+      ''
+    ).trim().toLowerCase();
+
+    if (candidate && candidate === value) return true;
+  }
+  return false;
+}
+
+function getMasteryScores() {
+  var scores = {};
+  var ss = SpreadsheetApp.getActive();
+  var progressSheet = safeGetSheet_(ss, 'UserProgress');
+  if (!(progressSheet && progressSheet.getLastRow() > 0 && progressSheet.getLastColumn() > 0)) return scores;
+
+  var rows = getDataRowsWithHeaderMap_(progressSheet);
+  rows.forEach(function (rowObj) {
+    var itemType = String(rowObj.ItemType || '').trim().toUpperCase();
+    if (itemType !== 'SENTENCE') return;
+
+    var itemId = String(rowObj.ItemID || '').trim();
+    if (!itemId) return;
+
+    var mastery = Number(rowObj.Mastery || 0);
+    if (!scores[itemId] || mastery > scores[itemId]) {
+      scores[itemId] = mastery;
+    }
+  });
+  return scores;
+}
+
+function isSchemaConsistent_(headers, rows) {
+  if (!headers || headers.length === 0) return false;
+  if (!rows || rows.length === 0) return true;
+  for (var i = 0; i < rows.length; i++) {
+    if (!rows[i] || rows[i].length !== headers.length) return false;
+  }
+  return true;
+}
+
+
+function resolveSelectedVocabRow_(wordBrowserSheet, explicitVocabID) {
+  var fromArg = String(explicitVocabID || '').trim();
+  if (fromArg) {
+    return lookupVocabById_(fromArg);
+  }
+
+  var active = wordBrowserSheet.getActiveRange();
+  if (!active) return null;
+
+  var row = active.getRow();
+  if (row < 2 || wordBrowserSheet.getLastColumn() === 0) return null;
+
+  var headers = wordBrowserSheet.getRange(1, 1, 1, wordBrowserSheet.getLastColumn()).getValues()[0]
+    .map(function (h) { return String(h || '').trim(); });
+  var values = wordBrowserSheet.getRange(row, 1, 1, headers.length).getValues()[0];
+
+  var rowObj = {};
+  for (var i = 0; i < headers.length; i++) {
+    if (headers[i]) rowObj[headers[i]] = values[i];
+  }
+
+  var selectedId = String(rowObj.VocabID || '').trim();
+  if (!selectedId) return null;
+
+  var full = lookupVocabById_(selectedId) || {};
+  return {
+    VocabID: selectedId,
+    Korean: full.Korean || rowObj.Korean || '',
+    English: full.English || rowObj.English || '',
+    Norm: full.Norm || rowObj.Norm || '',
+    Unit: full.Unit || rowObj.Unit || '',
+    Module: full.Module || rowObj.Module || '',
+    POS: full.POS || rowObj.POS || '',
+    Stem: full.Stem || rowObj.Stem || '',
+    ContributorID: ''
+  };
+}
+
+function lookupVocabById_(vocabID) {
+  var target = String(vocabID || '').trim();
+  if (!target) return null;
+
+  var ss = SpreadsheetApp.getActive();
+  var sheets = [
+    safeGetSheet_(ss, CONFIG.SHEETS.WORD_BROWSER),
+    safeGetSheet_(ss, CONFIG.SHEETS.VOCAB_RUNTIME),
+    safeGetSheet_(ss, CONFIG.SHEETS.VOCAB)
+  ];
+
+  for (var i = 0; i < sheets.length; i++) {
+    var sheet = sheets[i];
+    if (!(sheet && sheet.getLastRow() > 0 && sheet.getLastColumn() > 0)) continue;
+
+    var rows = getDataRowsWithHeaderMap_(sheet);
+    for (var j = 0; j < rows.length; j++) {
+      if (String(rows[j].VocabID || '').trim() === target) {
+        return rows[j];
+      }
+    }
+  }
+
+  return null;
+}
+
+function nextDraftId_(existingRows, headers) {
+  var maxN = 0;
+
+  if (existingRows && headers) {
+    var idx = headers.indexOf('DraftID');
+    if (idx !== -1) {
+      for (var i = 0; i < existingRows.length; i++) {
+        var draftId = String(existingRows[i][idx] || '');
+        var m = draftId.match(/(\d+)$/);
+        if (!m) continue;
+        var n = Number(m[1]);
+        if (n > maxN) maxN = n;
+      }
+    }
+  } else {
+    var ss = SpreadsheetApp.getActive();
+    var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+    if (assemblySheet && assemblySheet.getLastRow() > 0 && assemblySheet.getLastColumn() > 0) {
+      var payload = getDataRowsWithHeaderMap_(assemblySheet, true);
+      var draftIdx = payload.headers.indexOf('DraftID');
+      if (draftIdx !== -1) {
+        for (var j = 0; j < payload.values.length; j++) {
+          var existingId = String(payload.values[j][draftIdx] || '');
+          var em = existingId.match(/(\d+)$/);
+          if (!em) continue;
+          var en = Number(em[1]);
+          if (en > maxN) maxN = en;
+        }
+      }
+    }
+  }
+
+  return 'D' + Utilities.formatString('%06d', maxN + 1);
+}
+
+function getActiveDraftId_() {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  if (!(assemblySheet && assemblySheet.getLastRow() > 0 && assemblySheet.getLastColumn() > 0)) return null;
+
+  var payload = getDataRowsWithHeaderMap_(assemblySheet, true);
+  if (payload.headers.length === 0 || payload.values.length === 0) return null;
+
+  var draftIdCol = payload.headers.indexOf('DraftID');
+  var activeCol = payload.headers.indexOf('IsActive');
+  if (draftIdCol === -1 || activeCol === -1) return null;
+
+  for (var i = 0; i < payload.values.length; i++) {
+    if (!toBoolean_(payload.values[i][activeCol])) continue;
+    var did = String(payload.values[i][draftIdCol] || '').trim();
+    if (did) return did;
+  }
+  return null;
+}
+
+
+function resolveIdHeader_(sheetName, headers) {
+  var preferred = {
+    Vocab: 'VocabID',
+    Sentences: 'SentenceID',
+    Lessons: 'LessonID',
+    Quizzes: 'QuizID'
+  };
+
+  var exact = preferred[sheetName];
+  if (exact && headers.indexOf(exact) !== -1) return exact;
+
+  for (var i = 0; i < headers.length; i++) {
+    if (/ID$/i.test(headers[i])) return headers[i];
+  }
+  return '';
+}
+
+function mapRowToObject_(headers, rowValues) {
+  var rowObj = {};
+  for (var i = 0; i < headers.length; i++) {
+    rowObj[headers[i]] = rowValues[i];
+  }
+  return rowObj;
+}
+
+
+function nextVocabId_(existing) {
+  var maxN = 0;
+  Object.keys(existing || {}).forEach(function (id) {
+    var match = String(id || '').match(/(\d+)$/);
+    if (!match) return;
+    var num = Number(match[1]);
+    if (num > maxN) maxN = num;
+  });
+
+  var next = maxN + 1;
+  var candidate = 'V' + Utilities.formatString('%06d', next);
+  while (existing[candidate]) {
+    next += 1;
+    candidate = 'V' + Utilities.formatString('%06d', next);
+  }
+  return candidate;
+}
+
+function nextSentenceId_(existing) {
+  var maxN = 0;
+  Object.keys(existing).forEach(function (id) {
+    var match = String(id).match(/(\d+)$/);
+    if (!match) return;
+    var num = Number(match[1]);
+    if (num > maxN) maxN = num;
+  });
+  var next = maxN + 1;
+  var candidate = 'S' + Utilities.formatString('%06d', next);
+  while (existing[candidate]) {
+    next += 1;
+    candidate = 'S' + Utilities.formatString('%06d', next);
+  }
+  return candidate;
+}
+
+
+function compileSentenceFromTokens(draftID) {
+  var ss = SpreadsheetApp.getActive();
+  var assemblySheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY);
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  if (!(assemblySheet && tokensSheet && assemblySheet.getLastRow() > 0)) return '';
+
+  var assemblyPayload = getDataRowsWithHeaderMap_(assemblySheet, true);
+  var tokenRows = getDataRowsWithHeaderMap_(tokensSheet);
+  if (assemblyPayload.headers.length === 0) return '';
+
+  var aHeaders = assemblyPayload.headers;
+  var aValues = assemblyPayload.values;
+  var draftCol = aHeaders.indexOf('DraftID');
+  var compiledCol = ensureHeader_(assemblySheet, aHeaders, 'Korean_Compiled', aValues);
+  if (draftCol === -1) return '';
+
+  var grouped = {};
+  tokenRows.forEach(function (row) {
+    var did = String(row.DraftID || '').trim();
+    if (!did) return;
+    if (draftID && did !== String(draftID).trim()) return;
+    if (!grouped[did]) grouped[did] = [];
+    grouped[did].push({ seq: Number(row.Seq || 0), korean: String(row.Korean || '').trim() });
+  });
+
+  Object.keys(grouped).forEach(function (did) {
+    grouped[did].sort(function (a, b) { return a.seq - b.seq; });
+  });
+
+  var updated = false;
+  var latest = '';
+  for (var i = 0; i < aValues.length; i++) {
+    var did = String(aValues[i][draftCol] || '').trim();
+    if (!did) continue;
+    if (draftID && did !== String(draftID).trim()) continue;
+    var compiled = (grouped[did] || []).map(function (r) { return r.korean; }).filter(Boolean).join(' ');
+    aValues[i][compiledCol] = compiled;
+    latest = compiled;
+    updated = true;
+  }
+
+  if (updated && isSchemaConsistent_(aHeaders, aValues)) {
+    assemblySheet.getRange(2, 1, aValues.length, aHeaders.length).setValues(aValues);
+  }
+  return latest;
+}
+
+function applyParticleLogic(word, particleType) {
+  var base = String(word || '').trim();
+  if (!base) return '';
+  var hasBatchim = hasBatchim_(base);
+  var type = String(particleType || '').trim().toUpperCase();
+  var particle = '';
+
+  if (type === 'TOPIC') particle = hasBatchim ? '은' : '는';
+  if (type === 'SUBJECT') particle = hasBatchim ? '이' : '가';
+  if (type === 'OBJECT') particle = hasBatchim ? '을' : '를';
+  return base + particle;
+}
+
+function applyParticleToToken(draftTokenID, particleType) {
+  var ss = SpreadsheetApp.getActive();
+  var tokensSheet = safeGetSheet_(ss, CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS);
+  if (!(tokensSheet && tokensSheet.getLastRow() > 0)) return false;
+
+  var payload = getDataRowsWithHeaderMap_(tokensSheet, true);
+  var headers = payload.headers;
+  var values = payload.values;
+  var idCol = headers.indexOf('DraftTokenID');
+  var koreanCol = ensureHeader_(tokensSheet, headers, 'Korean', values);
+  var draftCol = headers.indexOf('DraftID');
+  if (idCol === -1 || draftCol === -1) return false;
+
+  var draftId = '';
+  var updated = false;
+  for (var i = 0; i < values.length; i++) {
+    if (String(values[i][idCol] || '').trim() !== String(draftTokenID || '').trim()) continue;
+    values[i][koreanCol] = applyParticleLogic(values[i][koreanCol], particleType);
+    draftId = String(values[i][draftCol] || '').trim();
+    updated = true;
+    break;
+  }
+  if (!updated || !isSchemaConsistent_(headers, values)) return false;
+  tokensSheet.getRange(2, 1, values.length, headers.length).setValues(values);
+  compileSentenceFromTokens(draftId);
+  updateSentenceAssemblyValidation();
+  return true;
+}
+
+function hasBatchim_(word) {
+  var text = String(word || '').trim();
+  if (!text) return false;
+  var ch = text.charAt(text.length - 1);
+  var code = ch.charCodeAt(0);
+  if (code < 0xAC00 || code > 0xD7A3) return false;
+  return ((code - 0xAC00) % 28) !== 0;
+}
+
+function resolveUnitFromModule_(moduleValue) {
+  var module = String(moduleValue || '').trim();
+  if (!module) return '';
+  var ss = SpreadsheetApp.getActive();
+  var mapSheet = safeGetSheet_(ss, CONFIG.SHEETS.UNIT_MODULE_MAP);
+  if (!(mapSheet && mapSheet.getLastRow() > 0)) return '';
+
+  var rows = getDataRowsWithHeaderMap_(mapSheet);
+  for (var i = 0; i < rows.length; i++) {
+    var rowModule = String(rows[i].Module || '').trim();
+    if (rowModule === module) return String(rows[i].Unit || '').trim();
+  }
+  return '';
+}
+
+function isUnitModuleValid_(unitValue, moduleValue) {
+  var unit = String(unitValue || '').trim();
+  var module = String(moduleValue || '').trim();
+  if (!unit || !module) return false;
+  var resolved = resolveUnitFromModule_(module);
+  if (!resolved) return true;
+  return resolved === unit;
+}
+
+function migrateSoftrToMaster() {
+  var ss = SpreadsheetApp.getActive();
+  var runtimeSheet = safeGetSheet_(ss, CONFIG.SHEETS.VOCAB_RUNTIME);
+  var masterSheet = safeGetSheet_(ss, CONFIG.SHEETS.VOCAB);
+  if (!(runtimeSheet && masterSheet && runtimeSheet.getLastRow() > 0 && masterSheet.getLastRow() > 0)) return 0;
+
+  var runtimePayload = getDataRowsWithHeaderMap_(runtimeSheet, true);
+  var masterPayload = getDataRowsWithHeaderMap_(masterSheet, true);
+  if (runtimePayload.headers.length === 0 || masterPayload.headers.length === 0) return 0;
+
+  var syncIndex = runtimePayload.headers.indexOf('SyncStatus');
+  if (syncIndex === -1) return 0;
+
+  var existingIds = {};
+  masterPayload.rows.forEach(function (rowObj) {
+    var id = String(rowObj.VocabID || '').trim();
+    if (id) existingIds[id] = true;
+  });
+
+  var rowsToAppend = [];
+  var remainingRuntimeRows = [];
+
+  runtimePayload.values.forEach(function (runtimeRow) {
+    var syncStatus = String(runtimeRow[syncIndex] || '').trim().toUpperCase();
+    if (syncStatus !== 'PENDING') {
+      remainingRuntimeRows.push(runtimeRow);
+      return;
+    }
+
+    var runtimeObj = mapRowToObject_(runtimePayload.headers, runtimeRow);
+    var vocabId = String(runtimeObj.VocabID || '').trim();
+    if (!vocabId || existingIds[vocabId]) {
+      vocabId = nextVocabId_(existingIds);
+    }
+    existingIds[vocabId] = true;
+
+    var masterRowObj = {};
+    masterPayload.headers.forEach(function (header) {
+      if (header === 'VocabID') {
+        masterRowObj[header] = vocabId;
+      } else if (header === 'Archived') {
+        masterRowObj[header] = toBoolean_(runtimeObj[header]) ? true : false;
+      } else {
+        masterRowObj[header] = runtimeObj[header] !== undefined ? runtimeObj[header] : '';
+      }
+    });
+    rowsToAppend.push(rowsToMatrix_([masterRowObj], masterPayload.headers)[0]);
+  });
+
+  if (rowsToAppend.length === 0) return 0;
+
+  if (isSchemaConsistent_(masterPayload.headers, rowsToAppend)) {
+    masterSheet
+      .getRange(masterSheet.getLastRow() + 1, 1, rowsToAppend.length, masterPayload.headers.length)
+      .setValues(rowsToAppend);
+  }
+
+  if (isSchemaConsistent_(runtimePayload.headers, remainingRuntimeRows)) {
+    writeRowsWithHeaders_(runtimeSheet, runtimePayload.headers, remainingRuntimeRows);
+  }
+
+  refreshRuntimeEcosystem();
+  return rowsToAppend.length;
+}
+
+/**
+ * Keeps browser runtimes synchronized when filter cells change.
+ */
+function onEdit(e) {
+  if (!e || !e.range || !e.source) return;
+
+  var sheet = e.range.getSheet();
+  var name = sheet.getName();
+  var editedHeader = getEditedHeaderName_(sheet, e.range.getColumn());
+
+  if (name === CONFIG.SHEETS.VOCAB_RUNTIME) {
+    migrateSoftrToMaster();
+    return;
+  }
+
+  if (name === CONFIG.SHEETS.VOCAB || name === CONFIG.SHEETS.SENTENCES) {
+    if (editedHeader === 'Module' && e.range.getRow() > 1) {
+      var payload = getDataRowsWithHeaderMap_(sheet, true);
+      var headers = payload.headers;
+      var values = payload.values;
+      if (headers.length > 0 && values.length >= e.range.getRow() - 1) {
+        var moduleCol = headers.indexOf('Module');
+        var unitCol = ensureHeader_(sheet, headers, 'Unit', values);
+        var rowIdx = e.range.getRow() - 2;
+        if (moduleCol > -1) {
+          var moduleValue = String(values[rowIdx][moduleCol] || '').trim();
+          var unitValue = resolveUnitFromModule_(moduleValue);
+          if (unitValue) {
+            values[rowIdx][unitCol] = unitValue;
+            if (isSchemaConsistent_(headers, values)) {
+              sheet.getRange(2, 1, values.length, headers.length).setValues(values);
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  if (name === CONFIG.SHEETS.SENTENCE_ASSEMBLY) {
+    var row = e.range.getRow();
+    if (row > 1 && sheet.getLastColumn() > 0) {
+      var ap = getDataRowsWithHeaderMap_(sheet, true);
+      var ah = ap.headers;
+      var av = ap.values;
+      if (ah.length > 0 && av.length >= row - 1) {
+        var draftCol = ensureHeader_(sheet, ah, 'DraftID', av);
+        var activeCol = ensureHeader_(sheet, ah, 'IsActive', av);
+        var contributorCol = ensureHeader_(sheet, ah, 'ContributorID', av);
+        var englishCol = ensureHeader_(sheet, ah, 'English_Translation', av);
+        var moduleColA = ensureHeader_(sheet, ah, 'Module', av);
+        var unitColA = ensureHeader_(sheet, ah, 'Unit', av);
+
+        if (e.range.getColumn() !== draftCol + 1) {
+          var rowIdxA = row - 2;
+          var hasDraft = String(av[rowIdxA][draftCol] || '').trim() !== '';
+          var hasSeedData = String(av[rowIdxA][contributorCol] || '').trim() !== '' || String(av[rowIdxA][englishCol] || '').trim() !== '';
+
+          if (!hasDraft && hasSeedData) {
+            var newDraftId = nextDraftId_();
+            av[rowIdxA][draftCol] = newDraftId;
+            av[rowIdxA][activeCol] = true;
+
+            var moduleValueA = String(av[rowIdxA][moduleColA] || '').trim();
+            if (moduleValueA && !String(av[rowIdxA][unitColA] || '').trim()) {
+              av[rowIdxA][unitColA] = resolveUnitFromModule_(moduleValueA);
+            }
+
+            for (var i = 0; i < av.length; i++) {
+              if (i === rowIdxA) continue;
+              av[i][activeCol] = false;
+            }
+
+            if (isSchemaConsistent_(ah, av)) {
+              sheet.getRange(2, 1, av.length, ah.length).setValues(av);
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  if (name === CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS) {
+    var tokenPayload = getDataRowsWithHeaderMap_(sheet, true);
+    if (tokenPayload.headers.length > 0) {
+      var draftColToken = tokenPayload.headers.indexOf('DraftID');
+      if (draftColToken > -1 && e.range.getRow() > 1) {
+        var draftId = String(sheet.getRange(e.range.getRow(), draftColToken + 1).getValue() || '').trim();
+        compileSentenceFromTokens(draftId);
+      } else {
+        compileSentenceFromTokens();
+      }
+    }
+    updateSentenceAssemblyValidation();
+    return;
+  }
+
+  if (name === CONFIG.SHEETS.WORD_BROWSER && (editedHeader === 'Filter_POS' || editedHeader === 'Filter_Module' || editedHeader === 'Filter_Level')) {
+    refreshWordBrowserRuntime();
+    refreshSentenceBrowserRuntime();
+    return;
+  }
+
+  if (name === CONFIG.SHEETS.SENTENCE_BROWSER && (editedHeader === 'Filter_POS' || editedHeader === 'Filter_Module' || editedHeader === 'Filter_Level')) {
+    refreshSentenceBrowserRuntime();
+  }
+}
+
+
+function onChange(e) {
+  if (!e || !e.source) return;
+  var sheet = e.source.getActiveSheet && e.source.getActiveSheet();
+  if (!sheet) return;
+  if (sheet.getName() !== CONFIG.SHEETS.SENTENCE_ASSEMBLY_TOKENS) return;
+  compileSentenceFromTokens();
+  updateSentenceAssemblyValidation();
+}
